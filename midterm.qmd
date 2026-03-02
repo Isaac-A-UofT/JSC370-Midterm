@@ -1,0 +1,787 @@
+---
+title: "Min-Maxing Bay Area Housing: What Actually Drives Listing Prices?"
+author: "Isaac Abell"
+date: "2026-02-17"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+# Introduction
+
+Housing in the San Francisco Bay Area is notoriously expensive. This project aims to understand what actually drives listing prices so prospective renters can identify where to get the most value. Is it possible to live near quality public transit, within a reasonable commute to major tech employers, and still find an affordable listing?
+
+The primary dataset is [Kate Pennington's archive of historic Bay Area Craigslist housing posts](https://github.com/katepennington/historic_bay_area_craigslist_housing_posts/blob/master/README.md), containing approximately 200,000 listings from 2000 to 2018. This data is enriched with two supplementary sources: the headquarters locations of major Bay Area tech companies (scraped from Wikipedia) and BART/Caltrain transit stop locations (retrieved from the 511.org API). Together, these allow investigation of how proximity to tech campuses and public transit relates to listing prices, in addition to standard features such as square footage and bedroom count.
+
+**Research Questions:**
+
+1. What factors most strongly influence Bay Area housing listing prices (e.g., location, size, proximity to transit, proximity to tech HQs)?
+2. How have these relationships changed over time (2000–2018)?
+3. Can we build a model that predicts listing price from these features and use it to identify undervalued areas?
+
+# Methods
+
+## Data Acquisition
+
+### Craigslist Housing Listings
+
+The primary dataset comes from [Kate Pennington's archive of historic Bay Area Craigslist housing posts](https://github.com/katepennington/historic_bay_area_craigslist_housing_posts), containing roughly 200,000 listings spanning 2000 to 2018. The dataset is distributed as a compressed CSV on GitHub. On first run, the file is downloaded via the `requests` library and cached locally so subsequent executions load instantly.
+
+```{python}
+#| echo: false
+#| output: false
+import os
+import io
+import re
+import json
+import zipfile
+from plotnine import *
+import pandas as pd
+import requests
+from io import StringIO
+from bs4 import BeautifulSoup
+```
+
+```{python}
+#| echo: false
+#| output: false
+LISTINGS_ZIP_PATH = "clean_2000_2018.csv.zip"
+LISTINGS_URL = "https://raw.githubusercontent.com/katepennington/historic_bay_area_craigslist_housing_posts/master/clean_2000_2018.csv.zip"
+LISTINGS_CSV_NAME = "clean_2000_2018.csv"
+
+if not os.path.exists(LISTINGS_ZIP_PATH):
+    response = requests.get(LISTINGS_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+        with z.open(LISTINGS_CSV_NAME) as f:
+            listings_raw = pd.read_csv(f)
+    listings_raw.to_csv(LISTINGS_ZIP_PATH, index=False, compression="zip")
+else:
+    try:
+        listings_raw = pd.read_csv(LISTINGS_ZIP_PATH, compression="zip")
+    except ValueError:
+        with zipfile.ZipFile(LISTINGS_ZIP_PATH) as z:
+            with z.open(LISTINGS_CSV_NAME) as f:
+                listings_raw = pd.read_csv(f)
+
+n_raw_listings = len(listings_raw)
+```
+
+After downloading, the raw dataset contains `{python} f"{n_raw_listings:,}"` listings.
+
+### Major Tech Company Headquarters (Web Scraping)
+
+A central hypothesis is that proximity to major tech employers inflates nearby rents. To identify which companies to consider, I scraped Wikipedia's [List of public corporations by market capitalization](https://en.wikipedia.org/wiki/List_of_public_corporations_by_market_capitalization#2000) to find the highest-valued US companies for each year from 2000 to 2025.
+
+The page contains two table formats: newer tables (2006–2025) have quarterly columns with flag/value pairs, while older tables (2000–2005) use a simpler layout with explicit "Country" and "Market value" columns. The scraping logic handles each format separately: I fetch the page, classify each `wikitable` by its column structure, then parse US companies and their market capitalizations accordingly.
+
+```{python}
+#| echo: false
+#| output: false
+WIKI_URL = "https://en.wikipedia.org/wiki/List_of_public_corporations_by_market_capitalization#2000"
+WIKI_HEADERS = {
+    "User-Agent": "jsc370-midterm (educational use)",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+response = requests.get(WIKI_URL, headers=WIKI_HEADERS, timeout=30)
+soup = BeautifulSoup(response.text, "html.parser")
+html_tables = soup.find_all("table", {"class": "wikitable"})
+```
+
+```{python}
+#| echo: false
+#| output: false
+quarterly_tables = []
+annual_tables = []
+
+for tbl in html_tables:
+    rows = tbl.find_all("tr")
+    if not rows:
+        continue
+    headers = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
+    if len(headers) == 5 and "First quarter" in str(headers):
+        quarterly_tables.append(tbl)
+    elif len(headers) == 5 and "Market value" in str(headers):
+        annual_tables.append(tbl)
+```
+
+```{python}
+#| echo: false
+#| output: false
+market_cap_records = []
+scrape_year = 2025
+QUARTER_PAIRS = [(1, 2), (3, 4), (5, 6), (7, 8)]
+
+for tbl in quarterly_tables:
+    seen_companies = set()
+    rows = tbl.find_all("tr")[1:]
+    for row in rows:
+        cells = row.find_all(["td", "th"])
+        if len(cells) < 9:
+            continue
+        for flag_idx, val_idx in QUARTER_PAIRS:
+            if val_idx >= len(cells):
+                continue
+            flag_cell = cells[flag_idx]
+            is_us = False
+            img = flag_cell.find("img")
+            if img and img.get("alt") and "United States" in img["alt"]:
+                is_us = True
+            elif flag_cell.find("a", title="United States"):
+                is_us = True
+            if is_us:
+                raw_text = cells[val_idx].get_text(" ", strip=True)
+                match = re.search(r"^(.*?)\s+([\d,]+)(?:\[.*\])?$", raw_text)
+                if match:
+                    name = match.group(1).strip()
+                    value_str = match.group(2).replace(",", "")
+                    if name not in seen_companies:
+                        market_cap_records.append({
+                            "year": scrape_year,
+                            "company": name,
+                            "market_value_usd_m": value_str,
+                            "source": "quarterly",
+                        })
+                        seen_companies.add(name)
+    scrape_year -= 1
+```
+
+```{python}
+#| echo: false
+#| output: false
+scrape_year = 2005
+for tbl in annual_tables:
+    tbl_df = pd.read_html(StringIO(str(tbl)))[0]
+    if "Country" in tbl_df.columns:
+        us_mask = tbl_df["Country"].astype(str).str.contains(
+            "United States|USA", case=False, na=False
+        )
+        for _, row in tbl_df[us_mask].iterrows():
+            market_cap_records.append({
+                "year": scrape_year,
+                "company": row["Name"],
+                "market_value_usd_m": row["Market value (USD million)"],
+                "source": "annual",
+            })
+    scrape_year -= 1
+
+market_cap_df = pd.DataFrame(market_cap_records)
+```
+
+#### Selecting Companies for the Proximity Analysis
+
+From the scraped data, Apple, Google, Facebook (Meta), Intel, and Cisco consistently appear as major Bay Area tech companies. Their inclusion in the analysis reflects when each became publicly traded and large enough to meaningfully influence local housing markets:
+
+- **Apple, Intel, Cisco** were already major employers by 2000 and are included for the entire period.
+- **Google** went public in 2004, so it enters the analysis that year.
+- **Facebook** went public in 2012, so it enters then.
+
+To broaden the analysis beyond just the Wikipedia list, several additional Bay Area tech companies with high market capitalizations are also included:
+
+| Company | Included From | Rationale |
+|---------|--------------|-----------|
+| Oracle | 2000 | Major Bay Area employer, high market cap |
+| Nvidia | 2000 | HQ in Santa Clara, high market cap |
+| Adobe | 2000 | HQ in San Jose, high market cap |
+| eBay | 2000 | HQ in San Jose, high market cap |
+| Netflix | 2002 | IPO in 2002, HQ in Los Gatos |
+| Salesforce | 2004 | HQ in San Francisco, high market cap |
+| Twitter | 2013 | HQ in San Francisco, high market cap |
+
+For each year from 2000 to 2018, a list of active company coordinates is constructed so that every listing can be compared against only the companies that were publicly traded at that time.
+
+```{python}
+#| echo: false
+#| output: false
+TECH_HQ_COORDS = {
+    "Apple": (37.3318, -122.0311),
+    "Google": (37.4220, -122.0841),
+    "Facebook": (37.4848, -122.1484),
+    "Intel": (37.3860, -121.9630),
+    "Cisco": (37.4118, -121.9263),
+    "Oracle": (37.5301, -122.2616),
+    "Nvidia": (37.3706, -121.9675),
+    "Adobe": (37.3307, -121.8941),
+    "eBay": (37.2946, -121.9257),
+    "Netflix": (37.2591, -121.9622),
+    "Salesforce": (37.7901, -122.3969),
+    "Twitter": (37.7768, -122.4170),
+}
+
+TECH_INCLUSION_YEAR = {
+    "Apple": 2000,
+    "Intel": 2000,
+    "Cisco": 2000,
+    "Oracle": 2000,
+    "Nvidia": 2000,
+    "Adobe": 2000,
+    "eBay": 2000,
+    "Netflix": 2002,
+    "Google": 2004,
+    "Salesforce": 2004,
+    "Facebook": 2012,
+    "Twitter": 2013,
+}
+
+tech_coords_by_year = {}
+for year in range(2000, 2019):
+    tech_coords_by_year[year] = [
+        TECH_HQ_COORDS[company]
+        for company, start in TECH_INCLUSION_YEAR.items()
+        if year >= start
+    ]
+```
+
+### Transit Station Locations (511.org API)
+
+Proximity to public transit is another key factor in housing prices. Using the [511.org Transit API](https://511.org/open-data/transit), I retrieved the locations of all BART and Caltrain stops: the two main rail systems in the Bay Area. Results are cached locally so the API is only called once.
+
+One caveat: some stations may have opened during or after the 2000–2018 study window. For simplicity, the current station set is treated as fixed, since the number of stations added during this period is small and unlikely to meaningfully distort the analysis.
+
+```{python}
+#| echo: false
+#| output: false
+TRANSIT_API_KEY = None # API KEY HERE
+TRANSIT_CACHE_PATH = "transit_stops.csv"
+
+if os.path.exists(TRANSIT_CACHE_PATH):
+    transit_stops_df = pd.read_csv(TRANSIT_CACHE_PATH)
+    transit_coords = list(zip(transit_stops_df["lat"], transit_stops_df["lon"]))
+else:
+    transit_coords = []
+    for operator_id in ["BA", "CT"]:
+        api_url = (
+            f"http://api.511.org/transit/stops"
+            f"?api_key={TRANSIT_API_KEY}&operator_id={operator_id}&format=json"
+        )
+        response = requests.get(api_url)
+        content = response.content.decode("utf-8-sig")
+        data = json.loads(content)
+        stops = data["Contents"]["dataObjects"]["ScheduledStopPoint"]
+        for stop in stops:
+            lat = float(stop["Location"]["Latitude"])
+            lon = float(stop["Location"]["Longitude"])
+            transit_coords.append((lat, lon))
+
+    transit_stops_df = pd.DataFrame(transit_coords, columns=["lat", "lon"])
+    transit_stops_df.to_csv(TRANSIT_CACHE_PATH, index=False)
+
+n_transit_stops = len(transit_coords)
+```
+
+A total of `{python} n_transit_stops` BART and Caltrain stops were retrieved and cached.
+
+## Data Cleaning and Wrangling
+
+### Geocoding Neighborhoods
+
+Most listings lack exact coordinates but include a neighborhood name. Each unique neighborhood was geocoded using the ArcGIS geocoder (free, no API key required), appending "Bay Area, California" for disambiguation. Results are cached to CSV so geocoding only runs once.
+
+The ArcGIS geocoder returned incorrect coordinates for several neighborhoods (e.g., "sunnyvale" resolved to Los Angeles, "milpitas" to the Mexican border). All entries outside a Bay Area bounding box were identified and corrected with manually verified coordinates.
+
+```{python}
+#| echo: false
+#| output: false
+from geopy.geocoders import ArcGIS
+from geopy.extra.rate_limiter import RateLimiter
+
+NEIGHBORHOOD_CACHE_PATH = "nhood_coords.csv"
+unique_neighborhoods = listings_raw["nhood"].dropna().unique()
+
+if os.path.exists(NEIGHBORHOOD_CACHE_PATH):
+    neighborhood_coords_df = pd.read_csv(NEIGHBORHOOD_CACHE_PATH)
+    neighborhood_coord_map = dict(
+        zip(neighborhood_coords_df["nhood"],
+            zip(neighborhood_coords_df["lat"], neighborhood_coords_df["lon"]))
+    )
+else:
+    geolocator = ArcGIS(timeout=10)
+    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=0.5)
+    neighborhood_coord_map = {}
+
+    for i, hood in enumerate(unique_neighborhoods):
+        query = f"{hood}, Bay Area, California, USA"
+        location = geocode(query)
+        if location:
+            neighborhood_coord_map[hood] = (location.latitude, location.longitude)
+        else:
+            neighborhood_coord_map[hood] = (None, None)
+
+    cache_df = pd.DataFrame([
+        {"nhood": k, "lat": v[0], "lon": v[1]} for k, v in neighborhood_coord_map.items()
+    ])
+    cache_df.to_csv(NEIGHBORHOOD_CACHE_PATH, index=False)
+    neighborhood_coords_df = cache_df
+```
+
+```{python}
+#| echo: false
+#| output: false
+BAY_AREA_BOUNDS = {
+    "lat_min": 36.8, "lat_max": 39.2,
+    "lon_min": -123.2, "lon_max": -121.3,
+}
+
+NEIGHBORHOOD_CORRECTIONS = {
+    "bayview": (37.7295, -122.3910),
+    "brisbane": (37.6808, -122.4000),
+    "civic / van ness": (37.7810, -122.4200),
+    "cloverdale": (38.8060, -123.0170),
+    "colma": (37.6770, -122.4560),
+    "corte madera": (37.9260, -122.5280),
+    "daly city": (37.6880, -122.4700),
+    "downtown": (37.7900, -122.4010),
+    "east bay": (37.8000, -122.2700),
+    "emeryville": (37.8320, -122.2860),
+    "marina / cow hollow": (37.8000, -122.4360),
+    "mill valley": (37.9060, -122.5420),
+    "milpitas": (37.4323, -121.8996),
+    "mission district": (37.7600, -122.4220),
+    "mountain view": (37.3861, -122.0839),
+    "noe valley": (37.7490, -122.4330),
+    "north bay": (38.0000, -122.5000),
+    "north beach / telegraph hill": (37.8060, -122.4100),
+    "oakland": (37.8044, -122.2712),
+    "oakland hills north / montclair": (37.8320, -122.2100),
+    "oakland hills south": (37.7980, -122.1850),
+    "oakland lake merritt / downtown": (37.7993, -122.2600),
+    "oakland north": (37.8370, -122.2620),
+    "oakland south": (37.7750, -122.2080),
+    "outer richmond": (37.7790, -122.4970),
+    "palo alto": (37.4419, -122.1430),
+    "portola": (37.7250, -122.4060),
+    "san anselmo": (37.9746, -122.5617),
+    "san jose east": (37.3400, -121.8500),
+    "san jose south": (37.2900, -121.8300),
+    "san jose west": (37.3100, -121.9600),
+    "san jose central": (37.3382, -121.8863),
+    "santa cruz": (36.9741, -122.0308),
+    "sunnyvale": (37.3688, -122.0363),
+    "west portal / forest hills": (37.7400, -122.4630),
+    "inner richmond": (37.7800, -122.4700),
+    "glen park": (37.7350, -122.4340),
+    "bernal": (37.7390, -122.4160),
+    "berkeley north / hills": (37.8900, -122.2600),
+    "buena vista park / ashbury hts / corona hts": (37.7670, -122.4410),
+    "coastside / pescadero": (37.2550, -122.3900),
+    "NOPA": (37.7760, -122.4400),
+    "SOMA / south beach": (37.7810, -122.3920),
+    "saratoga": (37.2638, -122.0230),
+    "sf bay area": (37.7600, -122.2000),
+    "south bay": (37.3500, -121.9500),
+    "geyserville": (38.7210, -122.9070),
+}
+
+neighborhood_coords_df = pd.read_csv(NEIGHBORHOOD_CACHE_PATH)
+n_corrected = 0
+
+for idx, row in neighborhood_coords_df.iterrows():
+    nhood = row["nhood"]
+    lat, lon = row["lat"], row["lon"]
+    needs_fix = (
+        pd.isna(lat) or pd.isna(lon)
+        or lat < BAY_AREA_BOUNDS["lat_min"] or lat > BAY_AREA_BOUNDS["lat_max"]
+        or lon < BAY_AREA_BOUNDS["lon_min"] or lon > BAY_AREA_BOUNDS["lon_max"]
+    )
+    if needs_fix and nhood in NEIGHBORHOOD_CORRECTIONS:
+        neighborhood_coords_df.at[idx, "lat"] = NEIGHBORHOOD_CORRECTIONS[nhood][0]
+        neighborhood_coords_df.at[idx, "lon"] = NEIGHBORHOOD_CORRECTIONS[nhood][1]
+        n_corrected += 1
+
+neighborhood_coords_df.to_csv(NEIGHBORHOOD_CACHE_PATH, index=False)
+neighborhood_coord_map = dict(
+    zip(neighborhood_coords_df["nhood"],
+        zip(neighborhood_coords_df["lat"], neighborhood_coords_df["lon"]))
+)
+```
+
+### Coordinate Assignment and Filtering
+
+Listings missing coordinates are filled in using their geocoded neighborhood. Listings with coordinates outside the Bay Area bounding box are also replaced with neighborhood-level coordinates. Rows that still lack any location information are dropped. Additionally, overly broad neighborhood labels (e.g., "sf bay area", "east bay", "south bay") are removed since they lack the geographic specificity needed for proximity analysis.
+
+```{python}
+#| echo: false
+#| output: false
+SELECTED_COLUMNS = [
+    "date", "year", "nhood", "city", "county", "price",
+    "beds", "baths", "sqft", "room_in_apt", "lat", "lon",
+    "title", "descr", "details",
+]
+
+listings = listings_raw[SELECTED_COLUMNS].copy()
+n_before_location_filter = len(listings)
+
+# Fill missing coords from neighborhood geocodes
+missing_coords_mask = listings["lat"].isna() & listings["nhood"].notna()
+listings.loc[missing_coords_mask, "lat"] = (
+    listings.loc[missing_coords_mask, "nhood"]
+    .map(lambda h: neighborhood_coord_map.get(h, (None, None))[0])
+)
+listings.loc[missing_coords_mask, "lon"] = (
+    listings.loc[missing_coords_mask, "nhood"]
+    .map(lambda h: neighborhood_coord_map.get(h, (None, None))[1])
+)
+
+# Replace out-of-bounds coordinates with neighborhood geocodes
+out_of_bounds_mask = (
+    (listings["lat"] < BAY_AREA_BOUNDS["lat_min"])
+    | (listings["lat"] > BAY_AREA_BOUNDS["lat_max"])
+    | (listings["lon"] < BAY_AREA_BOUNDS["lon_min"])
+    | (listings["lon"] > BAY_AREA_BOUNDS["lon_max"])
+) & listings["nhood"].notna()
+
+n_out_of_bounds = out_of_bounds_mask.sum()
+listings.loc[out_of_bounds_mask, "lat"] = (
+    listings.loc[out_of_bounds_mask, "nhood"]
+    .map(lambda h: neighborhood_coord_map.get(h, (None, None))[0])
+)
+listings.loc[out_of_bounds_mask, "lon"] = (
+    listings.loc[out_of_bounds_mask, "nhood"]
+    .map(lambda h: neighborhood_coord_map.get(h, (None, None))[1])
+)
+
+listings = listings.dropna(subset=["lat", "lon"])
+n_after_location_filter = len(listings)
+
+# Remove overly broad neighborhoods
+OVERLY_BROAD_NEIGHBORHOODS = [
+    "sf bay area", "east bay", "south bay",
+    "north bay", "peninsula", "marin", "napa county",
+]
+n_before_neighborhood_filter = len(listings)
+listings = listings[~listings["nhood"].isin(OVERLY_BROAD_NEIGHBORHOODS)]
+n_dropped_broad = n_before_neighborhood_filter - len(listings)
+```
+
+Of the original `{python} f"{n_before_location_filter:,}"` listings, the dataset was reduced to `{python} f"{n_after_location_filter:,}"` rows after dropping those without any resolvable location. An additional `{python} f"{n_dropped_broad:,}"` listings with overly broad neighborhood labels were removed, leaving `{python} f"{len(listings):,}"` rows.
+
+### Type Corrections and Outlier Removal
+
+The `beds` column contained some non-numeric entries (strings) that were coerced to numeric values. The `sqft` column has a large number of missing values, as many Craigslist posters do not include square footage in their listings. Rather than dropping these rows, which would discard a substantial portion of the data, square footage is retained as-is and treated as an optional feature in downstream analyses and modeling. Listings with square footage exceeding 5,000 sq ft were removed, as these likely represent land parcels or data entry errors rather than residential units.
+
+```{python}
+#| echo: false
+#| output: false
+listings["beds"] = pd.to_numeric(listings["beds"], errors="coerce")
+n_missing_beds = listings["beds"].isna().sum()
+n_missing_sqft = listings["sqft"].isna().sum()
+
+n_before_sqft_filter = len(listings)
+listings = listings[(listings["sqft"] < 5000) | listings["sqft"].isna()]
+n_dropped_sqft = n_before_sqft_filter - len(listings)
+```
+
+After cleaning, `{python} f"{n_missing_beds:,}"` listings have missing bedroom counts and `{python} f"{n_missing_sqft:,}"` listings have missing square footage. These are retained in the dataset but excluded from analyses that require those fields. An additional `{python} f"{n_dropped_sqft:,}"` rows with square footage above 5,000 were removed as outliers. The cleaned dataset contains `{python} f"{len(listings):,}"` listings.
+
+## Feature Engineering
+
+### Distance to Nearest Tech HQ
+
+For each listing, the Haversine distance to every tech company HQ active in that listing's year is computed, and the minimum is retained. This yields a single feature per listing: the distance (in km) to the nearest major tech employer.
+
+```{python}
+#| echo: false
+#| output: false
+from haversine import haversine, Unit
+
+def compute_min_tech_distance(row):
+    year = int(row["year"])
+    if year not in tech_coords_by_year:
+        return None
+    point = (row["lat"], row["lon"])
+    return min(
+        haversine(point, coord, unit=Unit.METERS) / 1000
+        for coord in tech_coords_by_year[year]
+    )
+
+listings["min_dist_tech_km"] = listings.apply(compute_min_tech_distance, axis=1)
+```
+
+### Distance to Nearest Transit Station
+
+Similarly, the Haversine distance from each listing to every BART and Caltrain stop is computed, and the minimum is kept. Since the station set is fixed (not year-dependent), the coordinate array is precomputed once.
+
+```{python}
+#| echo: false
+#| output: false
+def compute_min_transit_distance(row):
+    point = (row["lat"], row["lon"])
+    return min(
+        haversine(point, coord, unit=Unit.METERS) / 1000
+        for coord in transit_coords
+    )
+
+listings["min_dist_transit_km"] = listings.apply(compute_min_transit_distance, axis=1)
+```
+
+### Inflation Adjustment
+
+All prices are adjusted to 2025 dollars using the `cpi` library to enable meaningful comparisons across the 18-year span.
+
+```{python}
+#| echo: false
+#| output: false
+import cpi
+
+TARGET_YEAR = 2025
+unique_years = listings["year"].unique()
+inflation_factors = {
+    year: cpi.inflate(1, int(year), to=TARGET_YEAR)
+    for year in unique_years
+}
+listings["price_adj"] = listings["price"] * listings["year"].map(inflation_factors)
+```
+
+# Preliminary Results
+
+## Summary Statistics
+
+```{python}
+#| echo: false
+from IPython.display import display, Markdown
+
+numeric_cols = ["price_adj", "sqft", "beds", "baths", "min_dist_tech_km", "min_dist_transit_km"]
+summary = listings[numeric_cols].describe().T
+summary = summary[["count", "mean", "std", "min", "25%", "50%", "75%", "max"]]
+summary.columns = ["Count", "Mean", "Std Dev", "Min", "25th %", "Median", "75th %", "Max"]
+summary.index = [
+    "Rent (2025 USD)", "Square Footage", "Bedrooms",
+    "Bathrooms", "Dist. to Tech HQ (km)", "Dist. to Transit (km)",
+]
+
+# Format numbers
+for col in summary.columns:
+    if col == "Count":
+        summary[col] = summary[col].apply(lambda x: f"{int(x):,}")
+    else:
+        summary[col] = summary[col].apply(lambda x: f"{x:,.1f}")
+
+display(Markdown("**Table 1.** Summary statistics for key numeric features in the cleaned dataset."))
+display(Markdown(summary.to_markdown()))
+```
+
+The summary statistics confirm that values across all features fall within reasonable ranges. Median rent is approximately \$2,700/month (in 2025 dollars) with an interquartile range of roughly \$1,980–\$3,720, consistent with the Bay Area market. Square footage data is only available for about a third of listings (60,776 of 193,403), reflecting the fact that many Craigslist posters do not include this field; similar sparsity is seen for bathrooms (41,243). The distance features show that most listings cluster within 10 km of a transit station and 10–27 km of a major tech HQ.
+
+## Rent Trends Over Time
+
+```{python}
+#| echo: false
+yearly_price_summary = listings.groupby("year")["price"].mean().reset_index()
+yearly_price_summary["price_adj"] = yearly_price_summary.apply(
+    lambda x: cpi.inflate(x["price"], int(x["year"]), to=TARGET_YEAR), axis=1
+)
+
+rent_trend_df = yearly_price_summary.melt(
+    id_vars="year", value_vars=["price", "price_adj"],
+    var_name="type", value_name="rent",
+)
+rent_trend_df["type"] = rent_trend_df["type"].replace({
+    "price": "Nominal",
+    "price_adj": f"Adjusted ({TARGET_YEAR}$)",
+})
+
+(
+    ggplot(rent_trend_df, aes(x="year", y="rent", color="type"))
+    + geom_line(size=1.5)
+    + geom_point(size=3)
+    + labs(
+        title="Average Rent Over Time (Nominal vs. Inflation-Adjusted)",
+        x="Year",
+        y="Average Rent (USD)",
+    )
+    + theme_minimal()
+    + theme(legend_title=element_blank(), figure_size=(10, 6))
+)
+```
+
+Average rent in the Bay Area appears to increase substantially from 2000 to 2018. However, after adjusting for inflation the growth is more gradual and reveals greater year-to-year variance, with a more pronounced dip around 2009–2010 corresponding to the Great Recession. This demonstrates the importance of using inflation-adjusted prices: nominal trends overstate the real increase in housing costs. All subsequent analyses therefore use inflation-adjusted prices (2025 dollars) to enable fair cross-year comparisons.
+
+## Price Distribution
+
+```{python}
+#| echo: false
+(
+    ggplot(listings, aes(x="price_adj"))
+    + geom_histogram(bins=50, fill="#3498db", color="black", alpha=0.7)
+    + labs(
+        title="Distribution of Inflation-Adjusted Rent Prices",
+        x="Monthly Rent (2025 USD)",
+        y="Number of Listings",
+    )
+    + theme_minimal()
+    + theme(figure_size=(10, 6))
+)
+```
+
+The distribution of inflation-adjusted rents is right-skewed, with the vast majority of listings falling below \$10,000/month. A small tail extends past \$20,000, likely representing luxury properties. To keep visualizations interpretable, the histogram above and subsequent scatter plots cap the axis at \$20,000.
+
+## Rent vs. Key Features
+
+### Proximity to Tech Headquarters
+
+The scatter plot below shows that the densest cluster of listings sits within 0–20 km of a major tech HQ, with prices tapering off at greater distances. There is a weak negative trend: listings closer to tech campuses tend to have slightly higher average rents although there is significant variance in rent at all distances.
+
+```{python}
+#| echo: false
+(
+    ggplot(listings, aes(x="min_dist_tech_km", y="price_adj"))
+    + geom_point(alpha=0.05, size=0.5, color="#2c3e50")
+    + coord_cartesian(ylim=(0, 20000), xlim=(0, 60))
+    + labs(
+        title="Rent vs. Proximity to Nearest Tech HQ",
+        x="Distance to Nearest Tech HQ (km)",
+        y="Monthly Rent (2025 USD)",
+    )
+    + theme_minimal()
+    + theme(
+        plot_title=element_text(weight="bold", size=14),
+        figure_size=(10, 6),
+    )
+)
+```
+
+### Proximity to Transit
+
+A similar pattern emerges for transit proximity: listings within a few kilometers of a BART or Caltrain station show slightly higher average rents although there is significant variance in rent at all distances. The relationship is modest but consistent with the idea that transit access is capitalized into rental prices.
+
+```{python}
+#| echo: false
+(
+    ggplot(listings, aes(x="min_dist_transit_km", y="price_adj"))
+    + geom_point(alpha=0.05, size=0.5, color="#c0392b")
+    + coord_cartesian(ylim=(0, 20000), xlim=(0, 60))
+    + labs(
+        title="Rent vs. Proximity to Nearest Transit Station",
+        x="Distance to Nearest Transit Stop (km)",
+        y="Monthly Rent (2025 USD)",
+    )
+    + theme_minimal()
+    + theme(
+        plot_title=element_text(weight="bold", size=14),
+        figure_size=(10, 6),
+    )
+)
+```
+
+### Square Footage
+
+Square footage shows the strongest positive relationship with rent, as expected, larger units cost more. The relationship is roughly linear up to about 2,000 sq ft, after which the data becomes sparse and has significantly more variance.
+
+```{python}
+#| echo: false
+(
+    ggplot(listings, aes(x="sqft", y="price_adj"))
+    + geom_point(alpha=0.05, size=0.5, color="#27ae60")
+    + coord_cartesian(ylim=(0, 20000), xlim=(0, 5000))
+    + labs(
+        title="Rent vs. Square Footage",
+        x="Square Footage",
+        y="Monthly Rent (2025 USD)",
+    )
+    + theme_minimal()
+    + theme(
+        plot_title=element_text(weight="bold", size=14),
+        figure_size=(10, 6),
+    )
+)
+```
+
+### Bedroom Count
+
+Rent increases with each additional bedroom, though variance grows substantially for higher counts. Studios and 1-bedroom units have the tightest distribution, while 4+ bedroom listings show significantly more variance.
+
+```{python}
+#| echo: false
+(
+    ggplot(listings, aes(x="factor(beds)", y="price_adj"))
+    + geom_boxplot(fill="#8e44ad", alpha=0.6, outlier_alpha=0.1, outlier_size=0.5)
+    + coord_cartesian(ylim=(0, 25000))
+    + labs(
+        title="Rent Distribution by Bedroom Count",
+        x="Number of Bedrooms",
+        y="Monthly Rent (2025 USD)",
+    )
+    + theme_minimal()
+    + theme(
+        plot_title=element_text(weight="bold", size=14),
+        figure_size=(10, 6),
+    )
+)
+```
+
+## Correlation Analysis
+
+```{python}
+#| echo: false
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+FEATURE_LABELS = {
+    "sqft": "Square Footage",
+    "beds": "Bedrooms",
+    "baths": "Bathrooms",
+    "year": "Listing Year",
+    "min_dist_transit_km": "Dist. to Transit (km)",
+    "min_dist_tech_km": "Dist. to Tech HQ (km)",
+}
+
+corr_columns = list(FEATURE_LABELS.keys()) + ["price_adj"]
+corr_matrix = listings[corr_columns].corr()[["price_adj"]].drop("price_adj")
+corr_matrix = corr_matrix.rename(index=FEATURE_LABELS)
+corr_matrix.columns = ["Rental Cost"]
+corr_matrix = corr_matrix.sort_values(by="Rental Cost", ascending=False)
+
+plt.figure(figsize=(4, 6))
+sns.heatmap(
+    corr_matrix,
+    annot=True,
+    fmt=".2f",
+    cmap="RdBu_r",
+    vmin=-1, vmax=1,
+    cbar=False,
+    linewidths=1,
+    linecolor="white",
+)
+plt.title("Correlation with Inflation-Adjusted Rent", fontsize=12, pad=20)
+plt.yticks(rotation=0)
+plt.tight_layout()
+plt.show()
+```
+
+Square footage, bedroom count, and bathroom count show the strongest positive correlations with adjusted rent. Distance to tech HQ and distance to transit both show slight negative correlations. The listing year has a weak positive correlation, reflecting the overall upward trend in rents even after inflation adjustment.
+
+# Summary and Next Steps
+
+## Key Findings
+
+The exploratory analysis reveals several clear patterns in Bay Area rental pricing:
+
+1. **Size dominates pricing.** Square footage is the single strongest predictor of rent, followed by bedroom and bathroom counts. This is intuitive but confirms that listing size is the primary driver.
+
+2. **Proximity to tech and transit matters modestly.** Listings closer to major tech headquarters and BART/Caltrain stations tend to command slightly higher rents, though the correlations are weak (-0.13 to -0.18).
+
+3. **Inflation masks real trends.** Nominal rents nearly tripled from 2000 to 2018, but inflation-adjusted rents tell a more nuanced story: real rents grew slowly, with a clear dip during the 2008–2010 recession, rebounding during the 2012–2018 tech boom.
+
+## Plan for the Final Project
+
+The final project will build on this exploratory work in three areas:
+
+1. **Machine Learning Modeling:**
+    - Train a regression model to predict inflation-adjusted rent from features including square footage, bedrooms, bathrooms, latitude/longitude, distance to nearest tech HQ, distance to nearest transit station, and listing year.
+    - Evaluate model performance with cross-validation (RMSE, $R^2$) and interpret feature importances.
+    - Compare against a baseline linear regression to quantify the gain from non-linear modeling.
+
+2. **Interactive Price Heatmap:**
+    - Build an interactive map of the Bay Area that displays a heatmap of rental prices by location.
+    - Allow users to explore spatial price variation across neighborhoods and see how proximity to tech HQs and transit stations relates to local pricing.
+
+3. **Interactive Price Prediction Tool:**
+    - Deploy the trained model behind a simple interactive interface where a user can click any location on the Bay Area map and enter property details (square footage, bedrooms, bathrooms) to receive an estimated monthly rent.
+
+```{python}
+#| echo: false
+#| output: false
+listings.to_csv("bay_area_rent_listings_cleaned.csv", index=False)
+
+```
