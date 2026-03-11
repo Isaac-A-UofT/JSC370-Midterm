@@ -8,6 +8,9 @@ format:
 jupyter: python3
 ---
 
+# Github Repository
+[Here](https://github.com/Isaac-A-UofT/JSC370-Midterm) is the link to the Github Repo
+
 # Introduction
 
 Housing in the San Francisco Bay Area is notoriously expensive. This project aims to understand what actually drives listing prices so prospective renters can identify where to get the most value. Is it possible to live near quality public transit, within a reasonable commute to major tech employers, and still find an affordable listing?
